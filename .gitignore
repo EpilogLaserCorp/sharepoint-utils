@@ -1,0 +1,5 @@
+*/.env
+*.json
+*.md
+!README.md
+env/
