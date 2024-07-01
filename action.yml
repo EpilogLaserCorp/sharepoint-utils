@@ -1,0 +1,50 @@
+# action.yaml
+name: 'Sharepoint Utilities'
+description: 'Perform various Sharepoint site operations using client ID'
+inputs:
+  action:
+    description: 'The action to perform [upload_file]'
+    required: true
+  file_path:
+    description: 'Source file path(s multiline ok?) (glob ok)'
+    required: true
+  site_name:
+    description: 'Sharepoint site name (see README.md)'
+    required: true
+  host_name:
+    description: 'Sharepoint host name (see README.md)'
+    required: true
+  upload_path:
+    description: 'Target upload path (see README.md)'
+    required: true
+  tenant_id:
+    description: 'Sharepoint tenant ID'
+    required: true
+  client_id:
+    description: 'Sharepoint client ID'
+    required: true
+  client_secret:
+    description: 'Sharepoint client secret'
+    required: true
+  max_retries:
+    description: 'Max retries for upload'
+    required: false
+    default: 3
+outputs:
+  return:
+    description: 'Function output'
+    # need to specify the extra `value` field for `composite` actions
+    value: ${{ steps.send-file.outputs.return }}
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - ${{ inputs.action }}
+    - ${{ inputs.site_name }}
+    - ${{ inputs.host_name }}
+    - ${{ inputs.tenant_id }}
+    - ${{ inputs.client_id }}
+    - ${{ inputs.client_secret }}
+    - ${{ inputs.upload_path }}
+    - ${{ inputs.file_path }}
+    - ${{ inputs.max_retries }}
