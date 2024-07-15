@@ -1,8 +1,9 @@
 #!/bin/bash
-docker build -t test .
+SHAREPOINT_SITE_NAME="swengteam"
+SHAREPOINT_HOST_NAME="epiloglaser.sharepoint.com"
 dd if=/dev/urandom of=big.file bs=200M count=1
 dd if=/dev/urandom of=small.file bs=1M count=1
-docker run --rm -v ./:/usr/src/app/mnt test \
+node src/test.js \
     upload_file \
     $SHAREPOINT_SITE_NAME \
     $SHAREPOINT_HOST_NAME \
@@ -10,9 +11,9 @@ docker run --rm -v ./:/usr/src/app/mnt test \
     $CLIENT_ID \
     $CLIENT_SEC \
     "/tmp/" \
-    "mnt/big.file"
+    "big.file"
 
-docker run --rm -v ./:/usr/src/app/mnt test \
+node src/test.js \
     upload_file \
     $SHAREPOINT_SITE_NAME \
     $SHAREPOINT_HOST_NAME \
@@ -20,4 +21,4 @@ docker run --rm -v ./:/usr/src/app/mnt test \
     $CLIENT_ID \
     $CLIENT_SEC \
     "/tmp/" \
-    "mnt/small.file"
+    "small.file"

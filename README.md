@@ -1,7 +1,6 @@
 # Sharepoint Utilities
 
 Perform various Sharepoint site operations using client ID.
-**NOTE: Will not run on Windows workers**
 
 ## Variables
 The following environment variables & secrets must be defined.

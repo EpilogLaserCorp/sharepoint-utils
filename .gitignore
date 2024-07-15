@@ -3,3 +3,4 @@
 *.md
 !README.md
 env/
+node_modules/

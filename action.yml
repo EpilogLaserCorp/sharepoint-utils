@@ -36,15 +36,5 @@ outputs:
     # need to specify the extra `value` field for `composite` actions
     value: ${{ steps.send-file.outputs.return }}
 runs:
-  using: 'docker'
-  image: 'Dockerfile'
-  args:
-    - ${{ inputs.action }}
-    - ${{ inputs.site_name }}
-    - ${{ inputs.host_name }}
-    - ${{ inputs.tenant_id }}
-    - ${{ inputs.client_id }}
-    - ${{ inputs.client_secret }}
-    - ${{ inputs.upload_path }}
-    - ${{ inputs.file_path }}
-    - ${{ inputs.max_retries }}
+  using: 'node20'
+  main: 'dist/index.js'
