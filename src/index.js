@@ -1,26 +1,29 @@
 const client_lib = require("./client")
 const core = require('@actions/core');
-const github = require('@actions/github');
+const glob = require('glob');
 const path = require('path');
 
 async function uploadFiles(client, uploadPath, filePath) {
     const fileLines = filePath.split('\n');
-    for (const line of fileLines) {
-        const baseName = path.basename(line);
-        let fullUploadPath = uploadPath === "/" ? "/" : uploadPath.replace(/\/$/, "");
-        fullUploadPath = `${fullUploadPath}/${baseName}`;
-        console.log(`Uploading "${line}" to "${fullUploadPath}"...`);
-        try {
-            const response = await client.uploadFile(fullUploadPath, line);
-            if (response.status === 200 || response.status === 201) {
-                console.log(`Uploaded ${line}`);
-            } else {
-                console.error("Error uploading file. Response:", response.data);
+    for (const file_line of fileLines) {
+        const file_lines = glob.globSync(file_line)
+        for(const line of file_lines) {
+            const baseName = path.basename(line);
+            let fullUploadPath = uploadPath === "/" ? "/" : uploadPath.replace(/\/$/, "");
+            fullUploadPath = `${fullUploadPath}/${baseName}`;
+            console.log(`Uploading "${line}" to "${fullUploadPath}"...`);
+            try {
+                const response = await client.uploadFile(fullUploadPath, line);
+                if (response.status === 200 || response.status === 201) {
+                    console.log(`Uploaded ${line}`);
+                } else {
+                    console.error("Error uploading file. Response:", response.data);
+                    process.exit(1);
+                }
+            } catch (error) {
+                console.error("Error uploading file:", error.message);
                 process.exit(1);
             }
-        } catch (error) {
-            console.error("Error uploading file:", error.message);
-            process.exit(1);
         }
     }
     process.exit(0);
