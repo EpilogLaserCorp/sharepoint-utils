@@ -74,3 +74,20 @@ jobs:
           client_secret: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
 ```
 Inspired by: https://github.com/cringdahl/sharepoint-file-upload-action
+
+# Build instructions
+Install node/npm
+```
+curl -o- https://fnm.vercel.app/install | bash
+fnm install 20
+```
+
+Install ncc packager for packaging the utility
+```
+npm i -g @vercel/ncc
+```
+
+Build
+```
+ncc build src/index.js --license LICENSE
+```

@@ -105,7 +105,22 @@ class SharePointClient {
         const fileContent = await fs.readFile(filePath);
 
         if (fileSize < MAX_SMALL_FILE_SIZE) {
-            return await this.uploadSmallFile(uploadFilePath, fileContent);
+            let max_retries = 5;
+            let lastError = null;
+            while (max_retries > 0)
+            {
+                try {
+                    return await this.uploadSmallFile(uploadFilePath, fileContent);
+                } catch (error) {
+                    lastError = error;
+                    console.error("Error uploading small file:", error.response?.data);
+                    max_retries--;
+                    const retryAfterSeconds = error.response?.data?.error?.retryAfterSeconds || 5;
+                    console.log(`Retry ${max_retries} after ${retryAfterSeconds} seconds...`);
+                    await new Promise(resolve => setTimeout(resolve, retryAfterSeconds * 1000));
+                }
+            }
+            return lastError;
         } else {
             const response = await this.uploadSession(uploadFilePath);
             const responseJson = response.data;
@@ -114,9 +129,8 @@ class SharePointClient {
                 const totalSize = fileSize;
                 const chunkSize = 327680 * 100; // ~30MB
                 let offset = 0;
-                let ok = true;
-
-                while (ok && offset < totalSize) {
+                let max_retries = 5;
+                while (offset < totalSize) {
                     const thisChunkSize = Math.min(chunkSize, totalSize - offset);
                     const data = fileContent.slice(offset, offset + thisChunkSize);
 
@@ -129,10 +143,19 @@ class SharePointClient {
                     try {
                         await axios.put(responseJson.uploadUrl, data, { headers });
                         offset += thisChunkSize;
+                        // Reset the number of retries if successful, a given chunk should have a chance to be uploaded
+                        max_retries = 5;
                         console.log(`Uploaded ${convertSize(offset)}/${convertSize(totalSize)}`);
                     } catch (error) {
-                        ok = false;
                         console.error("Error doing session upload:", error.response?.data);
+                        if (max_retries > 0) {
+                            max_retries--;
+                            const retryAfterSeconds = error.response?.data?.error?.retryAfterSeconds || 5;
+                            console.log(`Retry ${max_retries} after ${retryAfterSeconds} seconds...`);
+                            await new Promise(resolve => setTimeout(resolve, retryAfterSeconds * 1000));
+                            continue;
+                        }
+                        throw error;
                     }
                 }
             }
