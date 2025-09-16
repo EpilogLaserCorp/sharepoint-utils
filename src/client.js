@@ -1,6 +1,7 @@
 const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
+const { minimatch } = require('minimatch');
 
 function convertSize(sizeBytes) {
     if (sizeBytes === 0) return "0B";
@@ -161,6 +162,159 @@ class SharePointClient {
             }
             return response;
         }
+    }
+
+    async downloadFile(sharepointFilePath, localFilePath) {
+        const fileUrl = `https://graph.microsoft.com/v1.0/sites/${this.siteId}/drive/root:${sharepointFilePath}:/content`;
+        let max_retries = 5;
+        let lastError = null;
+
+        while (max_retries > 0) {
+            try {
+                const response = await axios.get(fileUrl, {
+                    headers: { "Authorization": `Bearer ${this.accessToken}` },
+                    responseType: 'stream'
+                });
+
+                const totalSize = parseInt(response.headers['content-length'], 10);
+                let downloadedSize = 0;
+                
+                const writer = require('fs').createWriteStream(localFilePath);
+                
+                // Track progress if file size is available
+                if (totalSize && totalSize > 1024 * 1024) { // Only show progress for files > 1MB
+                    response.data.on('data', (chunk) => {
+                        downloadedSize += chunk.length;
+                        const percentage = ((downloadedSize / totalSize) * 100).toFixed(1);
+                        process.stdout.write(`\rDownloading ${path.basename(sharepointFilePath)}: ${percentage}% (${convertSize(downloadedSize)}/${convertSize(totalSize)})`);
+                    });
+                }
+                
+                response.data.pipe(writer);
+
+                return new Promise((resolve, reject) => {
+                    writer.on('finish', () => {
+                        if (totalSize && totalSize > 1024 * 1024) {
+                            process.stdout.write('\n'); // New line after progress
+                        }
+                        console.log(`Downloaded file to ${localFilePath}`);
+                        resolve(response);
+                    });
+                    writer.on('error', reject);
+                });
+            } catch (error) {
+                lastError = error;
+                console.error("Error downloading file:", error.response?.data);
+                max_retries--;
+                if (max_retries > 0) {
+                    const retryAfterSeconds = error.response?.data?.error?.retryAfterSeconds || 5;
+                    console.log(`Retry ${max_retries} after ${retryAfterSeconds} seconds...`);
+                    await new Promise(resolve => setTimeout(resolve, retryAfterSeconds * 1000));
+                } else {
+                    throw lastError;
+                }
+            }
+        }
+        throw lastError;
+    }
+
+    async listFolderRecursively(folderPath = '') {
+        const allFiles = [];
+        await this._listFolderRecursivelyHelper(folderPath, allFiles);
+        return allFiles;
+    }
+
+    async _listFolderRecursivelyHelper(folderPath, allFiles) {
+        const folderUrl = folderPath 
+            ? `https://graph.microsoft.com/v1.0/sites/${this.siteId}/drive/root:${folderPath}:/children`
+            : `https://graph.microsoft.com/v1.0/sites/${this.siteId}/drive/root/children`;
+
+        try {
+            const response = await axios.get(folderUrl, {
+                headers: { "Authorization": `Bearer ${this.accessToken}` }
+            });
+
+            const items = response.data.value || [];
+            
+            for (const item of items) {
+                const itemPath = folderPath ? `${folderPath}/${item.name}` : `/${item.name}`;
+                
+                if (item.folder) {
+                    await this._listFolderRecursivelyHelper(itemPath, allFiles);
+                } else {
+                    allFiles.push({
+                        name: item.name,
+                        path: itemPath,
+                        size: item.size || 0,
+                        lastModified: item.lastModifiedDateTime
+                    });
+                }
+            }
+        } catch (error) {
+            console.error(`Error listing folder ${folderPath}:`, error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    async listFolder(folderPath = '') {
+        const folderUrl = folderPath 
+            ? `https://graph.microsoft.com/v1.0/sites/${this.siteId}/drive/root:${folderPath}:/children`
+            : `https://graph.microsoft.com/v1.0/sites/${this.siteId}/drive/root/children`;
+
+        try {
+            const response = await axios.get(folderUrl, {
+                headers: { "Authorization": `Bearer ${this.accessToken}` }
+            });
+
+            const items = response.data.value || [];
+            return items.map(item => ({
+                name: item.name,
+                path: folderPath ? `${folderPath}/${item.name}` : `/${item.name}`,
+                isFolder: !!item.folder,
+                size: item.size || 0,
+                lastModified: item.lastModifiedDateTime
+            }));
+        } catch (error) {
+            console.error(`Error listing folder ${folderPath}:`, error.response?.data || error.message);
+            throw error;
+        }
+    }
+
+    matchWildcardPattern(files, pattern) {
+        return files.filter(file => {
+            const fileName = path.basename(file.path);
+            const filePath = file.path;
+            
+            return minimatch(fileName, pattern) || minimatch(filePath, pattern);
+        });
+    }
+
+    async downloadMultipleFiles(files, localBasePath) {
+        const results = [];
+        const totalFiles = files.length;
+        
+        console.log(`Starting download of ${totalFiles} files...`);
+        
+        for (let i = 0; i < files.length; i++) {
+            const file = files[i];
+            try {
+                // Preserve the relative path structure
+                const relativePath = file.path.startsWith('/') ? file.path.substring(1) : file.path;
+                const localFilePath = path.join(localBasePath, relativePath);
+                
+                await fs.mkdir(path.dirname(localFilePath), { recursive: true });
+                
+                console.log(`[${i + 1}/${totalFiles}] Downloading ${file.path}...`);
+                await this.downloadFile(file.path, localFilePath);
+                results.push({ success: true, file: file.path, localPath: localFilePath });
+                console.log(`Downloaded ${file.path} to ${localFilePath}`);
+            } catch (error) {
+                results.push({ success: false, file: file.path, error: error.message });
+                console.error(`Failed to download ${file.path}:`, error.message);
+            }
+        }
+        
+        return results;
     }
 }
 
