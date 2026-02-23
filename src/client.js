@@ -1,7 +1,7 @@
-const axios = require('axios');
-const fs = require('fs').promises;
-const path = require('path');
-const { minimatch } = require('minimatch');
+import axios from 'axios';
+import { promises as fs, createWriteStream } from 'fs';
+import path from 'path';
+import { minimatch } from 'minimatch';
 
 function convertSize(sizeBytes) {
     if (sizeBytes === 0) return "0B";
@@ -179,7 +179,7 @@ class SharePointClient {
                 const totalSize = parseInt(response.headers['content-length'], 10);
                 let downloadedSize = 0;
                 
-                const writer = require('fs').createWriteStream(localFilePath);
+                const writer = createWriteStream(localFilePath);
                 
                 // Track progress if file size is available
                 if (totalSize && totalSize > 1024 * 1024) { // Only show progress for files > 1MB
@@ -318,4 +318,4 @@ class SharePointClient {
     }
 }
 
-module.exports = { SharePointClient };
+export { SharePointClient };

@@ -2,7 +2,8 @@
   "name": "sharepoint-utils",
   "version": "1.0.0",
   "description": "Perform various Sharepoint site operations using client ID.",
-  "main": "index.js",
+  "type": "module",
+  "main": "dist/index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -10,9 +11,11 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@actions/core": "^1.11.1",
-    "@actions/github": "^6.0.0",
+    "@actions/core": "^3.0.0",
     "axios": "^1.7.7",
-    "glob": "^11.0.0"
+    "glob": "^13.0.6"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.3"
   }
 }
