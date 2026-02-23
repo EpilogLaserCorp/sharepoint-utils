@@ -1,12 +1,13 @@
-const client_lib = require("./client")
-const core = require('@actions/core');
-const glob = require('glob');
-const path = require('path');
+import * as client_lib from './client.js';
+import * as core from '@actions/core';
+import { globSync } from 'glob';
+import path from 'path';
+import { promises as fs } from 'fs';
 
 async function uploadFiles(client, uploadPath, filePath) {
     const fileLines = filePath.split('\n');
     for (const file_line of fileLines) {
-        const file_lines = glob.globSync(file_line)
+        const file_lines = globSync(file_line)
         for (const line of file_lines) {
             const baseName = path.basename(line);
             let fullUploadPath = uploadPath === "/" ? "/" : uploadPath.replace(/\/$/, "");
@@ -53,7 +54,6 @@ async function downloadFiles(client, downloadPath, localPath) {
                 console.log(`Downloading file "${trimmedLine}" to "${fullLocalPath}"...`);
                 try {
                     // Ensure the directory structure exists
-                    const fs = require('fs').promises;
                     await fs.mkdir(path.dirname(fullLocalPath), { recursive: true });
                     
                     await client.downloadFile(trimmedLine, fullLocalPath);

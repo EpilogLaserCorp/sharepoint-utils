@@ -82,12 +82,12 @@ curl -o- https://fnm.vercel.app/install | bash
 fnm install 20
 ```
 
-Install ncc packager for packaging the utility
+Install dependencies (includes esbuild)
 ```
-npm i -g @vercel/ncc
+npm install
 ```
 
 Build
 ```
-ncc build src/index.js --license LICENSE
+npx esbuild src/index.js --bundle --platform=node --format=cjs --legal-comments=eof --outfile=dist/index.js
 ```

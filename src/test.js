@@ -1,5 +1,5 @@
-const path = require('path');
-const client_lib = require("./client")
+import path from 'path';
+import * as client_lib from './client.js';
 
 async function uploadFiles(client, uploadPath, filePath) {
     const fileLines = filePath.split('\n');
