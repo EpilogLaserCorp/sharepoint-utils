@@ -36,5 +36,5 @@ outputs:
     # need to specify the extra `value` field for `composite` actions
     value: ${{ steps.send-file.outputs.return }}
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'

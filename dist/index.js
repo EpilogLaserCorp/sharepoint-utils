@@ -11507,6 +11507,21 @@ var require_errors = __commonJS({
       }
       [kSecureProxyConnectionError] = true;
     };
+    var kMessageSizeExceededError = /* @__PURE__ */ Symbol.for("undici.error.UND_ERR_WS_MESSAGE_SIZE_EXCEEDED");
+    var MessageSizeExceededError = class extends UndiciError {
+      constructor(message) {
+        super(message);
+        this.name = "MessageSizeExceededError";
+        this.message = message || "Max decompressed message size exceeded";
+        this.code = "UND_ERR_WS_MESSAGE_SIZE_EXCEEDED";
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance && instance[kMessageSizeExceededError] === true;
+      }
+      get [kMessageSizeExceededError]() {
+        return true;
+      }
+    };
     module2.exports = {
       AbortError,
       HTTPParserError,
@@ -11530,7 +11545,8 @@ var require_errors = __commonJS({
       ResponseExceededMaxSizeError,
       RequestRetryError,
       ResponseError,
-      SecureProxyConnectionError
+      SecureProxyConnectionError,
+      MessageSizeExceededError
     };
   }
 });
@@ -12540,6 +12556,9 @@ var require_request = __commonJS({
         if (upgrade && typeof upgrade !== "string") {
           throw new InvalidArgumentError("upgrade must be a string");
         }
+        if (upgrade && !isValidHeaderValue(upgrade)) {
+          throw new InvalidArgumentError("invalid upgrade header");
+        }
         if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
           throw new InvalidArgumentError("invalid headersTimeout");
         }
@@ -12772,12 +12791,18 @@ var require_request = __commonJS({
       } else {
         val = `${val}`;
       }
-      if (request.host === null && headerName === "host") {
+      if (headerName === "host") {
+        if (request.host !== null) {
+          throw new InvalidArgumentError("duplicate host header");
+        }
         if (typeof val !== "string") {
           throw new InvalidArgumentError("invalid host header");
         }
         request.host = val;
-      } else if (request.contentLength === null && headerName === "content-length") {
+      } else if (headerName === "content-length") {
+        if (request.contentLength !== null) {
+          throw new InvalidArgumentError("duplicate content-length header");
+        }
         request.contentLength = parseInt(val, 10);
         if (!Number.isFinite(request.contentLength)) {
           throw new InvalidArgumentError("invalid content-length header");
@@ -27549,13 +27574,17 @@ var require_util7 = __commonJS({
       return extensionList;
     }
     function isValidClientWindowBits(value) {
+      if (value.length === 0) {
+        return false;
+      }
       for (let i = 0; i < value.length; i++) {
         const byte = value.charCodeAt(i);
         if (byte < 48 || byte > 57) {
           return false;
         }
       }
-      return true;
+      const num = Number.parseInt(value, 10);
+      return num >= 8 && num <= 15;
     }
     var hasIntl = typeof process.versions.icu === "string";
     var fatalDecoder = hasIntl ? new TextDecoder("utf-8", { fatal: true }) : void 0;
@@ -27854,18 +27883,35 @@ var require_permessage_deflate = __commonJS({
     "use strict";
     var { createInflateRaw, Z_DEFAULT_WINDOWBITS } = require("node:zlib");
     var { isValidClientWindowBits } = require_util7();
+    var { MessageSizeExceededError } = require_errors();
     var tail = Buffer.from([0, 0, 255, 255]);
     var kBuffer = /* @__PURE__ */ Symbol("kBuffer");
     var kLength = /* @__PURE__ */ Symbol("kLength");
+    var kDefaultMaxDecompressedSize = 4 * 1024 * 1024;
     var PerMessageDeflate = class {
       /** @type {import('node:zlib').InflateRaw} */
       #inflate;
       #options = {};
-      constructor(extensions) {
+      /** @type {number} */
+      #maxDecompressedSize;
+      /** @type {boolean} */
+      #aborted = false;
+      /** @type {Function|null} */
+      #currentCallback = null;
+      /**
+       * @param {Map<string, string>} extensions
+       * @param {{ maxDecompressedMessageSize?: number }} [options]
+       */
+      constructor(extensions, options = {}) {
         this.#options.serverNoContextTakeover = extensions.has("server_no_context_takeover");
         this.#options.serverMaxWindowBits = extensions.get("server_max_window_bits");
+        this.#maxDecompressedSize = options.maxDecompressedMessageSize ?? kDefaultMaxDecompressedSize;
       }
       decompress(chunk, fin, callback) {
+        if (this.#aborted) {
+          callback(new MessageSizeExceededError());
+          return;
+        }
         if (!this.#inflate) {
           let windowBits = Z_DEFAULT_WINDOWBITS;
           if (this.#options.serverMaxWindowBits) {
@@ -27875,26 +27921,51 @@ var require_permessage_deflate = __commonJS({
             }
             windowBits = Number.parseInt(this.#options.serverMaxWindowBits);
           }
-          this.#inflate = createInflateRaw({ windowBits });
+          try {
+            this.#inflate = createInflateRaw({ windowBits });
+          } catch (err) {
+            callback(err);
+            return;
+          }
           this.#inflate[kBuffer] = [];
           this.#inflate[kLength] = 0;
           this.#inflate.on("data", (data) => {
-            this.#inflate[kBuffer].push(data);
+            if (this.#aborted) {
+              return;
+            }
             this.#inflate[kLength] += data.length;
+            if (this.#inflate[kLength] > this.#maxDecompressedSize) {
+              this.#aborted = true;
+              this.#inflate.removeAllListeners();
+              this.#inflate.destroy();
+              this.#inflate = null;
+              if (this.#currentCallback) {
+                const cb = this.#currentCallback;
+                this.#currentCallback = null;
+                cb(new MessageSizeExceededError());
+              }
+              return;
+            }
+            this.#inflate[kBuffer].push(data);
           });
           this.#inflate.on("error", (err) => {
             this.#inflate = null;
             callback(err);
           });
         }
+        this.#currentCallback = callback;
         this.#inflate.write(chunk);
         if (fin) {
           this.#inflate.write(tail);
         }
         this.#inflate.flush(() => {
+          if (this.#aborted || !this.#inflate) {
+            return;
+          }
           const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength]);
           this.#inflate[kBuffer].length = 0;
           this.#inflate[kLength] = 0;
+          this.#currentCallback = null;
           callback(null, full);
         });
       }
@@ -27934,12 +28005,20 @@ var require_receiver = __commonJS({
       #fragments = [];
       /** @type {Map<string, PerMessageDeflate>} */
       #extensions;
-      constructor(ws2, extensions) {
+      /** @type {{ maxDecompressedMessageSize?: number }} */
+      #options;
+      /**
+       * @param {import('./websocket').WebSocket} ws
+       * @param {Map<string, string>|null} extensions
+       * @param {{ maxDecompressedMessageSize?: number }} [options]
+       */
+      constructor(ws2, extensions, options = {}) {
         super();
         this.ws = ws2;
         this.#extensions = extensions == null ? /* @__PURE__ */ new Map() : extensions;
+        this.#options = options;
         if (this.#extensions.has("permessage-deflate")) {
-          this.#extensions.set("permessage-deflate", new PerMessageDeflate(extensions));
+          this.#extensions.set("permessage-deflate", new PerMessageDeflate(extensions, options));
         }
       }
       /**
@@ -28037,12 +28116,12 @@ var require_receiver = __commonJS({
             }
             const buffer = this.consume(8);
             const upper = buffer.readUInt32BE(0);
-            if (upper > 2 ** 31 - 1) {
+            const lower = buffer.readUInt32BE(4);
+            if (upper !== 0 || lower > 2 ** 31 - 1) {
               failWebsocketConnection(this.ws, "Received payload length > 2^31 bytes.");
               return;
             }
-            const lower = buffer.readUInt32BE(4);
-            this.#info.payloadLength = (upper << 8) + lower;
+            this.#info.payloadLength = lower;
             this.#state = parserStates.READ_DATA;
           } else if (this.#state === parserStates.READ_DATA) {
             if (this.#byteOffset < this.#info.payloadLength) {
@@ -28064,7 +28143,7 @@ var require_receiver = __commonJS({
               } else {
                 this.#extensions.get("permessage-deflate").decompress(body, this.#info.fin, (error2, data) => {
                   if (error2) {
-                    closeWebSocketConnection(this.ws, 1007, error2.message, error2.message.length);
+                    failWebsocketConnection(this.ws, error2.message);
                     return;
                   }
                   this.#fragments.push(data);
@@ -28333,6 +28412,8 @@ var require_websocket = __commonJS({
       #extensions = "";
       /** @type {SendQueue} */
       #sendQueue;
+      /** @type {{ maxDecompressedMessageSize?: number }} */
+      #options;
       /**
        * @param {string} url
        * @param {string|string[]} protocols
@@ -28376,6 +28457,9 @@ var require_websocket = __commonJS({
           throw new DOMException("Invalid Sec-WebSocket-Protocol value", "SyntaxError");
         }
         this[kWebSocketURL] = new URL(urlRecord.href);
+        this.#options = {
+          maxDecompressedMessageSize: options.maxDecompressedMessageSize
+        };
         const client = environmentSettingsObject.settingsObject;
         this[kController] = establishWebSocketConnection(
           urlRecord,
@@ -28559,7 +28643,7 @@ var require_websocket = __commonJS({
        */
       #onConnectionEstablished(response, parsedExtensions) {
         this[kResponse] = response;
-        const parser = new ByteParser(this, parsedExtensions);
+        const parser = new ByteParser(this, parsedExtensions, this.#options);
         parser.on("drain", onParserDrain);
         parser.on("error", onParserError.bind(this));
         response.socket.ws = this;
@@ -28634,6 +28718,19 @@ var require_websocket = __commonJS({
       {
         key: "headers",
         converter: webidl.nullableConverter(webidl.converters.HeadersInit)
+      },
+      {
+        key: "maxDecompressedMessageSize",
+        converter: webidl.nullableConverter((V2) => {
+          V2 = webidl.converters["unsigned long long"](V2);
+          if (V2 <= 0) {
+            throw webidl.errors.exception({
+              header: "WebSocket constructor",
+              message: "maxDecompressedMessageSize must be greater than 0"
+            });
+          }
+          return V2;
+        })
       }
     ]);
     webidl.converters["DOMString or sequence<DOMString> or WebSocketInit"] = function(V2) {
@@ -29429,12 +29526,25 @@ var isEmptyObject = (val) => {
 };
 var isDate = kindOfTest("Date");
 var isFile = kindOfTest("File");
+var isReactNativeBlob = (value) => {
+  return !!(value && typeof value.uri !== "undefined");
+};
+var isReactNative = (formData) => formData && typeof formData.getParts !== "undefined";
 var isBlob = kindOfTest("Blob");
 var isFileList = kindOfTest("FileList");
 var isStream = (val) => isObject(val) && isFunction(val.pipe);
+function getGlobal() {
+  if (typeof globalThis !== "undefined") return globalThis;
+  if (typeof self !== "undefined") return self;
+  if (typeof window !== "undefined") return window;
+  if (typeof global !== "undefined") return global;
+  return {};
+}
+var G = getGlobal();
+var FormDataCtor = typeof G.FormData !== "undefined" ? G.FormData : void 0;
 var isFormData = (thing) => {
   let kind;
-  return thing && (typeof FormData === "function" && thing instanceof FormData || isFunction(thing.append) && ((kind = kindOf(thing)) === "formdata" || // detect form-data instance
+  return thing && (FormDataCtor && thing instanceof FormDataCtor || isFunction(thing.append) && ((kind = kindOf(thing)) === "formdata" || // detect form-data instance
   kind === "object" && isFunction(thing.toString) && thing.toString() === "[object FormData]"));
 };
 var isURLSearchParams = kindOfTest("URLSearchParams");
@@ -29444,7 +29554,9 @@ var [isReadableStream, isRequest, isResponse, isHeaders] = [
   "Response",
   "Headers"
 ].map(kindOfTest);
-var trim = (str) => str.trim ? str.trim() : str.replace(/^[\s\uFEFF\xA0]+|[\s\uFEFF\xA0]+$/g, "");
+var trim = (str) => {
+  return str.trim ? str.trim() : str.replace(/^[\s\uFEFF\xA0]+|[\s\uFEFF\xA0]+$/g, "");
+};
 function forEach(obj, fn, { allOwnKeys = false } = {}) {
   if (obj === null || typeof obj === "undefined") {
     return;
@@ -29546,10 +29658,7 @@ var stripBOM = (content) => {
   return content;
 };
 var inherits = (constructor, superConstructor, props, descriptors) => {
-  constructor.prototype = Object.create(
-    superConstructor.prototype,
-    descriptors
-  );
+  constructor.prototype = Object.create(superConstructor.prototype, descriptors);
   Object.defineProperty(constructor.prototype, "constructor", {
     value: constructor,
     writable: true,
@@ -29748,6 +29857,8 @@ var utils_default = {
   isUndefined,
   isDate,
   isFile,
+  isReactNativeBlob,
+  isReactNative,
   isBlob,
   isRegExp,
   isFunction,
@@ -29796,6 +29907,9 @@ var AxiosError = class _AxiosError extends Error {
     const axiosError = new _AxiosError(error2.message, code || error2.code, config, request, response);
     axiosError.cause = error2;
     axiosError.name = error2.name;
+    if (error2.status != null && axiosError.status == null) {
+      axiosError.status = error2.status;
+    }
     customProps && Object.assign(axiosError, customProps);
     return axiosError;
   }
@@ -29812,6 +29926,12 @@ var AxiosError = class _AxiosError extends Error {
    */
   constructor(message, code, config, request, response) {
     super(message);
+    Object.defineProperty(this, "message", {
+      value: message,
+      enumerable: true,
+      writable: true,
+      configurable: true
+    });
     this.name = "AxiosError";
     this.isAxiosError = true;
     code && (this.code = code);
@@ -29885,13 +30005,18 @@ function toFormData(obj, formData, options) {
     throw new TypeError("target must be an object");
   }
   formData = formData || new (FormData_default || FormData)();
-  options = utils_default.toFlatObject(options, {
-    metaTokens: true,
-    dots: false,
-    indexes: false
-  }, false, function defined(option, source) {
-    return !utils_default.isUndefined(source[option]);
-  });
+  options = utils_default.toFlatObject(
+    options,
+    {
+      metaTokens: true,
+      dots: false,
+      indexes: false
+    },
+    false,
+    function defined(option, source) {
+      return !utils_default.isUndefined(source[option]);
+    }
+  );
   const metaTokens = options.metaTokens;
   const visitor = options.visitor || defaultVisitor;
   const dots = options.dots;
@@ -29919,6 +30044,10 @@ function toFormData(obj, formData, options) {
   }
   function defaultVisitor(value, key, path4) {
     let arr = value;
+    if (utils_default.isReactNative(formData) && utils_default.isReactNativeBlob(value)) {
+      formData.append(renderKey(path4, key, dots), convertValue(value));
+      return false;
+    }
     if (value && !path4 && typeof value === "object") {
       if (utils_default.endsWith(key, "{}")) {
         key = metaTokens ? key : key.slice(0, -2);
@@ -29954,13 +30083,7 @@ function toFormData(obj, formData, options) {
     }
     stack.push(value);
     utils_default.forEach(value, function each(el, key) {
-      const result = !(utils_default.isUndefined(el) || el === null) && visitor.call(
-        formData,
-        el,
-        utils_default.isString(key) ? key.trim() : key,
-        path4,
-        exposedHelpers
-      );
+      const result = !(utils_default.isUndefined(el) || el === null) && visitor.call(formData, el, utils_default.isString(key) ? key.trim() : key, path4, exposedHelpers);
       if (result === true) {
         build(el, path4 ? path4.concat(key) : [key]);
       }
@@ -30255,70 +30378,74 @@ function stringifySafely(rawValue, parser, encoder) {
 var defaults = {
   transitional: transitional_default,
   adapter: ["xhr", "http", "fetch"],
-  transformRequest: [function transformRequest(data, headers) {
-    const contentType = headers.getContentType() || "";
-    const hasJSONContentType = contentType.indexOf("application/json") > -1;
-    const isObjectPayload = utils_default.isObject(data);
-    if (isObjectPayload && utils_default.isHTMLForm(data)) {
-      data = new FormData(data);
-    }
-    const isFormData2 = utils_default.isFormData(data);
-    if (isFormData2) {
-      return hasJSONContentType ? JSON.stringify(formDataToJSON_default(data)) : data;
-    }
-    if (utils_default.isArrayBuffer(data) || utils_default.isBuffer(data) || utils_default.isStream(data) || utils_default.isFile(data) || utils_default.isBlob(data) || utils_default.isReadableStream(data)) {
-      return data;
-    }
-    if (utils_default.isArrayBufferView(data)) {
-      return data.buffer;
-    }
-    if (utils_default.isURLSearchParams(data)) {
-      headers.setContentType("application/x-www-form-urlencoded;charset=utf-8", false);
-      return data.toString();
-    }
-    let isFileList2;
-    if (isObjectPayload) {
-      if (contentType.indexOf("application/x-www-form-urlencoded") > -1) {
-        return toURLEncodedForm(data, this.formSerializer).toString();
+  transformRequest: [
+    function transformRequest(data, headers) {
+      const contentType = headers.getContentType() || "";
+      const hasJSONContentType = contentType.indexOf("application/json") > -1;
+      const isObjectPayload = utils_default.isObject(data);
+      if (isObjectPayload && utils_default.isHTMLForm(data)) {
+        data = new FormData(data);
       }
-      if ((isFileList2 = utils_default.isFileList(data)) || contentType.indexOf("multipart/form-data") > -1) {
-        const _FormData = this.env && this.env.FormData;
-        return toFormData_default(
-          isFileList2 ? { "files[]": data } : data,
-          _FormData && new _FormData(),
-          this.formSerializer
-        );
+      const isFormData2 = utils_default.isFormData(data);
+      if (isFormData2) {
+        return hasJSONContentType ? JSON.stringify(formDataToJSON_default(data)) : data;
       }
-    }
-    if (isObjectPayload || hasJSONContentType) {
-      headers.setContentType("application/json", false);
-      return stringifySafely(data);
-    }
-    return data;
-  }],
-  transformResponse: [function transformResponse(data) {
-    const transitional2 = this.transitional || defaults.transitional;
-    const forcedJSONParsing = transitional2 && transitional2.forcedJSONParsing;
-    const JSONRequested = this.responseType === "json";
-    if (utils_default.isResponse(data) || utils_default.isReadableStream(data)) {
-      return data;
-    }
-    if (data && utils_default.isString(data) && (forcedJSONParsing && !this.responseType || JSONRequested)) {
-      const silentJSONParsing = transitional2 && transitional2.silentJSONParsing;
-      const strictJSONParsing = !silentJSONParsing && JSONRequested;
-      try {
-        return JSON.parse(data, this.parseReviver);
-      } catch (e) {
-        if (strictJSONParsing) {
-          if (e.name === "SyntaxError") {
-            throw AxiosError_default.from(e, AxiosError_default.ERR_BAD_RESPONSE, this, null, this.response);
-          }
-          throw e;
+      if (utils_default.isArrayBuffer(data) || utils_default.isBuffer(data) || utils_default.isStream(data) || utils_default.isFile(data) || utils_default.isBlob(data) || utils_default.isReadableStream(data)) {
+        return data;
+      }
+      if (utils_default.isArrayBufferView(data)) {
+        return data.buffer;
+      }
+      if (utils_default.isURLSearchParams(data)) {
+        headers.setContentType("application/x-www-form-urlencoded;charset=utf-8", false);
+        return data.toString();
+      }
+      let isFileList2;
+      if (isObjectPayload) {
+        if (contentType.indexOf("application/x-www-form-urlencoded") > -1) {
+          return toURLEncodedForm(data, this.formSerializer).toString();
+        }
+        if ((isFileList2 = utils_default.isFileList(data)) || contentType.indexOf("multipart/form-data") > -1) {
+          const _FormData = this.env && this.env.FormData;
+          return toFormData_default(
+            isFileList2 ? { "files[]": data } : data,
+            _FormData && new _FormData(),
+            this.formSerializer
+          );
         }
       }
+      if (isObjectPayload || hasJSONContentType) {
+        headers.setContentType("application/json", false);
+        return stringifySafely(data);
+      }
+      return data;
     }
-    return data;
-  }],
+  ],
+  transformResponse: [
+    function transformResponse(data) {
+      const transitional2 = this.transitional || defaults.transitional;
+      const forcedJSONParsing = transitional2 && transitional2.forcedJSONParsing;
+      const JSONRequested = this.responseType === "json";
+      if (utils_default.isResponse(data) || utils_default.isReadableStream(data)) {
+        return data;
+      }
+      if (data && utils_default.isString(data) && (forcedJSONParsing && !this.responseType || JSONRequested)) {
+        const silentJSONParsing = transitional2 && transitional2.silentJSONParsing;
+        const strictJSONParsing = !silentJSONParsing && JSONRequested;
+        try {
+          return JSON.parse(data, this.parseReviver);
+        } catch (e) {
+          if (strictJSONParsing) {
+            if (e.name === "SyntaxError") {
+              throw AxiosError_default.from(e, AxiosError_default.ERR_BAD_RESPONSE, this, null, this.response);
+            }
+            throw e;
+          }
+        }
+      }
+      return data;
+    }
+  ],
   /**
    * A timeout in milliseconds to abort a request. If set to 0 (default) a
    * timeout is not created.
@@ -30337,7 +30464,7 @@ var defaults = {
   },
   headers: {
     common: {
-      "Accept": "application/json, text/plain, */*",
+      Accept: "application/json, text/plain, */*",
       "Content-Type": void 0
     }
   }
@@ -30608,7 +30735,14 @@ var AxiosHeaders = class {
     return this;
   }
 };
-AxiosHeaders.accessor(["Content-Type", "Content-Length", "Accept", "Accept-Encoding", "User-Agent", "Authorization"]);
+AxiosHeaders.accessor([
+  "Content-Type",
+  "Content-Length",
+  "Accept",
+  "Accept-Encoding",
+  "User-Agent",
+  "Authorization"
+]);
 utils_default.reduceDescriptors(AxiosHeaders.prototype, ({ value }, key) => {
   let mapped = key[0].toUpperCase() + key.slice(1);
   return {
@@ -30664,13 +30798,15 @@ function settle(resolve, reject, response) {
   if (!response.status || !validateStatus2 || validateStatus2(response.status)) {
     resolve(response);
   } else {
-    reject(new AxiosError_default(
-      "Request failed with status code " + response.status,
-      [AxiosError_default.ERR_BAD_REQUEST, AxiosError_default.ERR_BAD_RESPONSE][Math.floor(response.status / 100) - 4],
-      response.config,
-      response.request,
-      response
-    ));
+    reject(
+      new AxiosError_default(
+        "Request failed with status code " + response.status,
+        [AxiosError_default.ERR_BAD_REQUEST, AxiosError_default.ERR_BAD_RESPONSE][Math.floor(response.status / 100) - 4],
+        response.config,
+        response.request,
+        response
+      )
+    );
   }
 }
 
@@ -30706,7 +30842,7 @@ var import_follow_redirects = __toESM(require_follow_redirects(), 1);
 var import_zlib = __toESM(require("zlib"), 1);
 
 // node_modules/axios/lib/env/data.js
-var VERSION = "1.13.5";
+var VERSION = "1.13.6";
 
 // node_modules/axios/lib/helpers/parseProtocol.js
 function parseProtocol(url2) {
@@ -30751,16 +30887,21 @@ var import_stream = __toESM(require("stream"), 1);
 var kInternals = /* @__PURE__ */ Symbol("internals");
 var AxiosTransformStream = class extends import_stream.default.Transform {
   constructor(options) {
-    options = utils_default.toFlatObject(options, {
-      maxRate: 0,
-      chunkSize: 64 * 1024,
-      minChunkSize: 100,
-      timeWindow: 500,
-      ticksRate: 2,
-      samplesCount: 15
-    }, null, (prop, source) => {
-      return !utils_default.isUndefined(source[prop]);
-    });
+    options = utils_default.toFlatObject(
+      options,
+      {
+        maxRate: 0,
+        chunkSize: 64 * 1024,
+        minChunkSize: 100,
+        timeWindow: 500,
+        ticksRate: 2,
+        samplesCount: 15
+      },
+      null,
+      (prop, source) => {
+        return !utils_default.isUndefined(source[prop]);
+      }
+    );
     super({
       readableHighWaterMark: options.chunkSize
     });
@@ -30843,9 +30984,12 @@ var AxiosTransformStream = class extends import_stream.default.Transform {
         chunkRemainder = _chunk.subarray(maxChunkSize);
         _chunk = _chunk.subarray(0, maxChunkSize);
       }
-      pushChunk(_chunk, chunkRemainder ? () => {
-        process.nextTick(_callback, null, chunkRemainder);
-      } : _callback);
+      pushChunk(
+        _chunk,
+        chunkRemainder ? () => {
+          process.nextTick(_callback, null, chunkRemainder);
+        } : _callback
+      );
     };
     transformChunk(chunk, function transformNextChunk(err, _chunk) {
       if (err) {
@@ -30916,11 +31060,14 @@ var FormDataPart = class {
     yield CRLF_BYTES;
   }
   static escapeName(name) {
-    return String(name).replace(/[\r\n"]/g, (match2) => ({
-      "\r": "%0D",
-      "\n": "%0A",
-      '"': "%22"
-    })[match2]);
+    return String(name).replace(
+      /[\r\n"]/g,
+      (match2) => ({
+        "\r": "%0D",
+        "\n": "%0A",
+        '"': "%22"
+      })[match2]
+    );
   }
 };
 var formDataToStream = (form, headersHandler, options) => {
@@ -30952,13 +31099,15 @@ var formDataToStream = (form, headersHandler, options) => {
     computedHeaders["Content-Length"] = contentLength;
   }
   headersHandler && headersHandler(computedHeaders);
-  return import_stream2.Readable.from((async function* () {
-    for (const part of parts) {
-      yield boundaryBytes;
-      yield* part.encode();
-    }
-    yield footerBytes;
-  })());
+  return import_stream2.Readable.from(
+    (async function* () {
+      for (const part of parts) {
+        yield boundaryBytes;
+        yield* part.encode();
+      }
+      yield footerBytes;
+    })()
+  );
 };
 var formDataToStream_default = formDataToStream;
 
@@ -31097,11 +31246,14 @@ var progressEventReducer = (listener, isDownloadStream, freq = 3) => {
 };
 var progressEventDecorator = (total, throttled) => {
   const lengthComputable = total != null;
-  return [(loaded) => throttled[0]({
-    lengthComputable,
-    total,
-    loaded
-  }), throttled[1]];
+  return [
+    (loaded) => throttled[0]({
+      lengthComputable,
+      total,
+      loaded
+    }),
+    throttled[1]
+  ];
 };
 var asyncDecorator = (fn) => (...args) => utils_default.asap(() => fn(...args));
 
@@ -31180,9 +31332,12 @@ var Http2Sessions = class {
     this.sessions = /* @__PURE__ */ Object.create(null);
   }
   getSession(authority, options) {
-    options = Object.assign({
-      sessionTimeout: 1e3
-    }, options);
+    options = Object.assign(
+      {
+        sessionTimeout: 1e3
+      },
+      options
+    );
     let authoritySessions = this.sessions[authority];
     if (authoritySessions) {
       let len = authoritySessions.length;
@@ -31236,10 +31391,7 @@ var Http2Sessions = class {
       };
     }
     session.once("close", removeSession);
-    let entry = [
-      session,
-      options
-    ];
+    let entry = [session, options];
     authoritySessions ? authoritySessions.push(entry) : authoritySessions = this.sessions[authority] = [entry];
     return session;
   }
@@ -31325,12 +31477,7 @@ var http2Transport = {
     const authority = options.protocol + "//" + options.hostname + ":" + (options.port || (options.protocol === "https:" ? 443 : 80));
     const { http2Options, headers } = options;
     const session = http2Sessions.getSession(authority, http2Options);
-    const {
-      HTTP2_HEADER_SCHEME,
-      HTTP2_HEADER_METHOD,
-      HTTP2_HEADER_PATH,
-      HTTP2_HEADER_STATUS
-    } = import_http2.default.constants;
+    const { HTTP2_HEADER_SCHEME, HTTP2_HEADER_METHOD, HTTP2_HEADER_PATH, HTTP2_HEADER_STATUS } = import_http2.default.constants;
     const http2Headers = {
       [HTTP2_HEADER_SCHEME]: options.protocol.replace(":", ""),
       [HTTP2_HEADER_METHOD]: options.method,
@@ -31383,7 +31530,10 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
     const abortEmitter = new import_events.EventEmitter();
     function abort(reason) {
       try {
-        abortEmitter.emit("abort", !reason || reason.type ? new CanceledError_default(null, config, req) : reason);
+        abortEmitter.emit(
+          "abort",
+          !reason || reason.type ? new CanceledError_default(null, config, req) : reason
+        );
       } catch (err) {
         console.warn("emit error", err);
       }
@@ -31429,11 +31579,13 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
         const dataUrl = String(config.url || fullPath || "");
         const estimated = estimateDataURLDecodedBytes(dataUrl);
         if (estimated > config.maxContentLength) {
-          return reject(new AxiosError_default(
-            "maxContentLength size of " + config.maxContentLength + " exceeded",
-            AxiosError_default.ERR_BAD_RESPONSE,
-            config
-          ));
+          return reject(
+            new AxiosError_default(
+              "maxContentLength size of " + config.maxContentLength + " exceeded",
+              AxiosError_default.ERR_BAD_RESPONSE,
+              config
+            )
+          );
         }
       }
       let convertedData;
@@ -31469,11 +31621,9 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
       });
     }
     if (supportedProtocols.indexOf(protocol) === -1) {
-      return reject(new AxiosError_default(
-        "Unsupported protocol " + protocol,
-        AxiosError_default.ERR_BAD_REQUEST,
-        config
-      ));
+      return reject(
+        new AxiosError_default("Unsupported protocol " + protocol, AxiosError_default.ERR_BAD_REQUEST, config)
+      );
     }
     const headers = AxiosHeaders_default.from(config.headers).normalize();
     headers.set("User-Agent", "axios/" + VERSION, false);
@@ -31483,12 +31633,16 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
     let maxDownloadRate = void 0;
     if (utils_default.isSpecCompliantForm(data)) {
       const userBoundary = headers.getContentType(/boundary=([-_\w\d]{10,70})/i);
-      data = formDataToStream_default(data, (formHeaders) => {
-        headers.set(formHeaders);
-      }, {
-        tag: `axios-${VERSION}-boundary`,
-        boundary: userBoundary && userBoundary[1] || void 0
-      });
+      data = formDataToStream_default(
+        data,
+        (formHeaders) => {
+          headers.set(formHeaders);
+        },
+        {
+          tag: `axios-${VERSION}-boundary`,
+          boundary: userBoundary && userBoundary[1] || void 0
+        }
+      );
     } else if (utils_default.isFormData(data) && utils_default.isFunction(data.getHeaders)) {
       headers.set(data.getHeaders());
       if (!headers.hasContentLength()) {
@@ -31509,19 +31663,23 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
       } else if (utils_default.isString(data)) {
         data = Buffer.from(data, "utf-8");
       } else {
-        return reject(new AxiosError_default(
-          "Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream",
-          AxiosError_default.ERR_BAD_REQUEST,
-          config
-        ));
+        return reject(
+          new AxiosError_default(
+            "Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream",
+            AxiosError_default.ERR_BAD_REQUEST,
+            config
+          )
+        );
       }
       headers.setContentLength(data.length, false);
       if (config.maxBodyLength > -1 && data.length > config.maxBodyLength) {
-        return reject(new AxiosError_default(
-          "Request body larger than maxBodyLength limit",
-          AxiosError_default.ERR_BAD_REQUEST,
-          config
-        ));
+        return reject(
+          new AxiosError_default(
+            "Request body larger than maxBodyLength limit",
+            AxiosError_default.ERR_BAD_REQUEST,
+            config
+          )
+        );
       }
     }
     const contentLength = utils_default.toFiniteNumber(headers.getContentLength());
@@ -31535,16 +31693,25 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
       if (!utils_default.isStream(data)) {
         data = import_stream4.default.Readable.from(data, { objectMode: false });
       }
-      data = import_stream4.default.pipeline([data, new AxiosTransformStream_default({
-        maxRate: utils_default.toFiniteNumber(maxUploadRate)
-      })], utils_default.noop);
-      onUploadProgress && data.on("progress", flushOnFinish(
-        data,
-        progressEventDecorator(
-          contentLength,
-          progressEventReducer(asyncDecorator(onUploadProgress), false, 3)
+      data = import_stream4.default.pipeline(
+        [
+          data,
+          new AxiosTransformStream_default({
+            maxRate: utils_default.toFiniteNumber(maxUploadRate)
+          })
+        ],
+        utils_default.noop
+      );
+      onUploadProgress && data.on(
+        "progress",
+        flushOnFinish(
+          data,
+          progressEventDecorator(
+            contentLength,
+            progressEventReducer(asyncDecorator(onUploadProgress), false, 3)
+          )
         )
-      ));
+      );
     }
     let auth = void 0;
     if (config.auth) {
@@ -31595,7 +31762,11 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
     } else {
       options.hostname = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
       options.port = parsed.port;
-      setProxy(options, config.proxy, protocol + "//" + parsed.hostname + (parsed.port ? ":" + parsed.port : "") + options.path);
+      setProxy(
+        options,
+        config.proxy,
+        protocol + "//" + parsed.hostname + (parsed.port ? ":" + parsed.port : "") + options.path
+      );
     }
     let transport;
     const isHttpsRequest = isHttps.test(options.protocol);
@@ -31633,13 +31804,16 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
         const transformStream = new AxiosTransformStream_default({
           maxRate: utils_default.toFiniteNumber(maxDownloadRate)
         });
-        onDownloadProgress && transformStream.on("progress", flushOnFinish(
-          transformStream,
-          progressEventDecorator(
-            responseLength,
-            progressEventReducer(asyncDecorator(onDownloadProgress), true, 3)
+        onDownloadProgress && transformStream.on(
+          "progress",
+          flushOnFinish(
+            transformStream,
+            progressEventDecorator(
+              responseLength,
+              progressEventReducer(asyncDecorator(onDownloadProgress), true, 3)
+            )
           )
-        ));
+        );
         streams.push(transformStream);
       }
       let responseStream = res;
@@ -31689,12 +31863,14 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
           if (config.maxContentLength > -1 && totalResponseBytes > config.maxContentLength) {
             rejected = true;
             responseStream.destroy();
-            abort(new AxiosError_default(
-              "maxContentLength size of " + config.maxContentLength + " exceeded",
-              AxiosError_default.ERR_BAD_RESPONSE,
-              config,
-              lastRequest
-            ));
+            abort(
+              new AxiosError_default(
+                "maxContentLength size of " + config.maxContentLength + " exceeded",
+                AxiosError_default.ERR_BAD_RESPONSE,
+                config,
+                lastRequest
+              )
+            );
           }
         });
         responseStream.on("aborted", function handlerStreamAborted() {
@@ -31753,12 +31929,14 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
     if (config.timeout) {
       const timeout = parseInt(config.timeout, 10);
       if (Number.isNaN(timeout)) {
-        abort(new AxiosError_default(
-          "error trying to parse `config.timeout` to int",
-          AxiosError_default.ERR_BAD_OPTION_VALUE,
-          config,
-          req
-        ));
+        abort(
+          new AxiosError_default(
+            "error trying to parse `config.timeout` to int",
+            AxiosError_default.ERR_BAD_OPTION_VALUE,
+            config,
+            req
+          )
+        );
         return;
       }
       req.setTimeout(timeout, function handleRequestTimeout() {
@@ -31768,12 +31946,14 @@ var http_default = isHttpAdapterSupported && function httpAdapter(config) {
         if (config.timeoutErrorMessage) {
           timeoutErrorMessage = config.timeoutErrorMessage;
         }
-        abort(new AxiosError_default(
-          timeoutErrorMessage,
-          transitional2.clarifyTimeoutError ? AxiosError_default.ETIMEDOUT : AxiosError_default.ECONNABORTED,
-          config,
-          req
-        ));
+        abort(
+          new AxiosError_default(
+            timeoutErrorMessage,
+            transitional2.clarifyTimeoutError ? AxiosError_default.ETIMEDOUT : AxiosError_default.ECONNABORTED,
+            config,
+            req
+          )
+        );
       });
     } else {
       req.setTimeout(0);
@@ -31928,16 +32108,12 @@ function mergeConfig(config1, config2) {
     validateStatus: mergeDirectKeys,
     headers: (a, b, prop) => mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true)
   };
-  utils_default.forEach(
-    Object.keys({ ...config1, ...config2 }),
-    function computeConfigValue(prop) {
-      if (prop === "__proto__" || prop === "constructor" || prop === "prototype")
-        return;
-      const merge2 = utils_default.hasOwnProp(mergeMap, prop) ? mergeMap[prop] : mergeDeepProperties;
-      const configValue = merge2(config1[prop], config2[prop], prop);
-      utils_default.isUndefined(configValue) && merge2 !== mergeDirectKeys || (config[prop] = configValue);
-    }
-  );
+  utils_default.forEach(Object.keys({ ...config1, ...config2 }), function computeConfigValue(prop) {
+    if (prop === "__proto__" || prop === "constructor" || prop === "prototype") return;
+    const merge2 = utils_default.hasOwnProp(mergeMap, prop) ? mergeMap[prop] : mergeDeepProperties;
+    const configValue = merge2(config1[prop], config2[prop], prop);
+    utils_default.isUndefined(configValue) && merge2 !== mergeDirectKeys || (config[prop] = configValue);
+  });
   return config;
 }
 
@@ -31946,11 +32122,17 @@ var resolveConfig_default = (config) => {
   const newConfig = mergeConfig({}, config);
   let { data, withXSRFToken, xsrfHeaderName, xsrfCookieName, headers, auth } = newConfig;
   newConfig.headers = headers = AxiosHeaders_default.from(headers);
-  newConfig.url = buildURL(buildFullPath(newConfig.baseURL, newConfig.url, newConfig.allowAbsoluteUrls), config.params, config.paramsSerializer);
+  newConfig.url = buildURL(
+    buildFullPath(newConfig.baseURL, newConfig.url, newConfig.allowAbsoluteUrls),
+    config.params,
+    config.paramsSerializer
+  );
   if (auth) {
     headers.set(
       "Authorization",
-      "Basic " + btoa((auth.username || "") + ":" + (auth.password ? unescape(encodeURIComponent(auth.password)) : ""))
+      "Basic " + btoa(
+        (auth.username || "") + ":" + (auth.password ? unescape(encodeURIComponent(auth.password)) : "")
+      )
     );
   }
   if (utils_default.isFormData(data)) {
@@ -32014,13 +32196,17 @@ var xhr_default = isXHRAdapterSupported && function(config) {
         config,
         request
       };
-      settle(function _resolve(value) {
-        resolve(value);
-        done();
-      }, function _reject(err) {
-        reject(err);
-        done();
-      }, response);
+      settle(
+        function _resolve(value) {
+          resolve(value);
+          done();
+        },
+        function _reject(err) {
+          reject(err);
+          done();
+        },
+        response
+      );
       request = null;
     }
     if ("onloadend" in request) {
@@ -32056,12 +32242,14 @@ var xhr_default = isXHRAdapterSupported && function(config) {
       if (_config.timeoutErrorMessage) {
         timeoutErrorMessage = _config.timeoutErrorMessage;
       }
-      reject(new AxiosError_default(
-        timeoutErrorMessage,
-        transitional2.clarifyTimeoutError ? AxiosError_default.ETIMEDOUT : AxiosError_default.ECONNABORTED,
-        config,
-        request
-      ));
+      reject(
+        new AxiosError_default(
+          timeoutErrorMessage,
+          transitional2.clarifyTimeoutError ? AxiosError_default.ETIMEDOUT : AxiosError_default.ECONNABORTED,
+          config,
+          request
+        )
+      );
       request = null;
     };
     requestData === void 0 && requestHeaders.setContentType(null);
@@ -32101,7 +32289,13 @@ var xhr_default = isXHRAdapterSupported && function(config) {
     }
     const protocol = parseProtocol(_config.url);
     if (protocol && platform_default.protocols.indexOf(protocol) === -1) {
-      reject(new AxiosError_default("Unsupported protocol " + protocol + ":", AxiosError_default.ERR_BAD_REQUEST, config));
+      reject(
+        new AxiosError_default(
+          "Unsupported protocol " + protocol + ":",
+          AxiosError_default.ERR_BAD_REQUEST,
+          config
+        )
+      );
       return;
     }
     request.send(requestData || null);
@@ -32119,7 +32313,9 @@ var composeSignals = (signals, timeout) => {
         aborted = true;
         unsubscribe();
         const err = reason instanceof Error ? reason : this.reason;
-        controller.abort(err instanceof AxiosError_default ? err : new CanceledError_default(err instanceof Error ? err.message : err));
+        controller.abort(
+          err instanceof AxiosError_default ? err : new CanceledError_default(err instanceof Error ? err.message : err)
+        );
       }
     };
     let timer = timeout && setTimeout(() => {
@@ -32192,33 +32388,36 @@ var trackStream = (stream4, chunkSize, onProgress, onFinish) => {
       onFinish && onFinish(e);
     }
   };
-  return new ReadableStream({
-    async pull(controller) {
-      try {
-        const { done: done2, value } = await iterator2.next();
-        if (done2) {
-          _onFinish();
-          controller.close();
-          return;
+  return new ReadableStream(
+    {
+      async pull(controller) {
+        try {
+          const { done: done2, value } = await iterator2.next();
+          if (done2) {
+            _onFinish();
+            controller.close();
+            return;
+          }
+          let len = value.byteLength;
+          if (onProgress) {
+            let loadedBytes = bytes += len;
+            onProgress(loadedBytes);
+          }
+          controller.enqueue(new Uint8Array(value));
+        } catch (err) {
+          _onFinish(err);
+          throw err;
         }
-        let len = value.byteLength;
-        if (onProgress) {
-          let loadedBytes = bytes += len;
-          onProgress(loadedBytes);
-        }
-        controller.enqueue(new Uint8Array(value));
-      } catch (err) {
-        _onFinish(err);
-        throw err;
+      },
+      cancel(reason) {
+        _onFinish(reason);
+        return iterator2.return();
       }
     },
-    cancel(reason) {
-      _onFinish(reason);
-      return iterator2.return();
+    {
+      highWaterMark: 2
     }
-  }, {
-    highWaterMark: 2
-  });
+  );
 };
 
 // node_modules/axios/lib/adapters/fetch.js
@@ -32228,10 +32427,7 @@ var globalFetchAPI = (({ Request, Response }) => ({
   Request,
   Response
 }))(utils_default.global);
-var {
-  ReadableStream: ReadableStream2,
-  TextEncoder: TextEncoder2
-} = utils_default.global;
+var { ReadableStream: ReadableStream2, TextEncoder: TextEncoder2 } = utils_default.global;
 var test = (fn, ...args) => {
   try {
     return !!fn(...args);
@@ -32240,9 +32436,13 @@ var test = (fn, ...args) => {
   }
 };
 var factory = (env) => {
-  env = utils_default.merge.call({
-    skipUndefined: true
-  }, globalFetchAPI, env);
+  env = utils_default.merge.call(
+    {
+      skipUndefined: true
+    },
+    globalFetchAPI,
+    env
+  );
   const { fetch: envFetch, Request, Response } = env;
   const isFetchSupported = envFetch ? isFunction2(envFetch) : typeof fetch === "function";
   const isRequestSupported = isFunction2(Request);
@@ -32275,7 +32475,11 @@ var factory = (env) => {
         if (method) {
           return method.call(res);
         }
-        throw new AxiosError_default(`Response type '${type}' is not supported`, AxiosError_default.ERR_NOT_SUPPORT, config);
+        throw new AxiosError_default(
+          `Response type '${type}' is not supported`,
+          AxiosError_default.ERR_NOT_SUPPORT,
+          config
+        );
       });
     });
   })();
@@ -32324,7 +32528,10 @@ var factory = (env) => {
     } = resolveConfig_default(config);
     let _fetch = envFetch || fetch;
     responseType = responseType ? (responseType + "").toLowerCase() : "text";
-    let composedSignal = composeSignals_default([signal, cancelToken && cancelToken.toAbortSignal()], timeout);
+    let composedSignal = composeSignals_default(
+      [signal, cancelToken && cancelToken.toAbortSignal()],
+      timeout
+    );
     let request = null;
     const unsubscribe = composedSignal && composedSignal.unsubscribe && (() => {
       composedSignal.unsubscribe();
@@ -32384,7 +32591,10 @@ var factory = (env) => {
         );
       }
       responseType = responseType || "text";
-      let responseData = await resolvers[utils_default.findKey(resolvers, responseType) || "text"](response, config);
+      let responseData = await resolvers[utils_default.findKey(resolvers, responseType) || "text"](
+        response,
+        config
+      );
       !isStreamResponse && unsubscribe && unsubscribe();
       return await new Promise((resolve, reject) => {
         settle(resolve, reject, {
@@ -32400,7 +32610,13 @@ var factory = (env) => {
       unsubscribe && unsubscribe();
       if (err && err.name === "TypeError" && /Load failed|fetch/i.test(err.message)) {
         throw Object.assign(
-          new AxiosError_default("Network Error", AxiosError_default.ERR_NETWORK, config, request, err && err.response),
+          new AxiosError_default(
+            "Network Error",
+            AxiosError_default.ERR_NETWORK,
+            config,
+            request,
+            err && err.response
+          ),
           {
             cause: err.cause || err
           }
@@ -32414,11 +32630,7 @@ var seedCache = /* @__PURE__ */ new Map();
 var getFetch = (config) => {
   let env = config && config.env || {};
   const { fetch: fetch2, Request, Response } = env;
-  const seeds = [
-    Request,
-    Response,
-    fetch2
-  ];
+  const seeds = [Request, Response, fetch2];
   let len = seeds.length, i = len, seed, target, map = seedCache;
   while (i--) {
     seed = seeds[i];
@@ -32507,37 +32719,33 @@ function throwIfCancellationRequested(config) {
 function dispatchRequest(config) {
   throwIfCancellationRequested(config);
   config.headers = AxiosHeaders_default.from(config.headers);
-  config.data = transformData.call(
-    config,
-    config.transformRequest
-  );
+  config.data = transformData.call(config, config.transformRequest);
   if (["post", "put", "patch"].indexOf(config.method) !== -1) {
     config.headers.setContentType("application/x-www-form-urlencoded", false);
   }
   const adapter2 = adapters_default.getAdapter(config.adapter || defaults_default.adapter, config);
-  return adapter2(config).then(function onAdapterResolution(response) {
-    throwIfCancellationRequested(config);
-    response.data = transformData.call(
-      config,
-      config.transformResponse,
-      response
-    );
-    response.headers = AxiosHeaders_default.from(response.headers);
-    return response;
-  }, function onAdapterRejection(reason) {
-    if (!isCancel(reason)) {
+  return adapter2(config).then(
+    function onAdapterResolution(response) {
       throwIfCancellationRequested(config);
-      if (reason && reason.response) {
-        reason.response.data = transformData.call(
-          config,
-          config.transformResponse,
-          reason.response
-        );
-        reason.response.headers = AxiosHeaders_default.from(reason.response.headers);
+      response.data = transformData.call(config, config.transformResponse, response);
+      response.headers = AxiosHeaders_default.from(response.headers);
+      return response;
+    },
+    function onAdapterRejection(reason) {
+      if (!isCancel(reason)) {
+        throwIfCancellationRequested(config);
+        if (reason && reason.response) {
+          reason.response.data = transformData.call(
+            config,
+            config.transformResponse,
+            reason.response
+          );
+          reason.response.headers = AxiosHeaders_default.from(reason.response.headers);
+        }
       }
+      return Promise.reject(reason);
     }
-    return Promise.reject(reason);
-  });
+  );
 }
 
 // node_modules/axios/lib/helpers/validator.js
@@ -32590,7 +32798,10 @@ function assertOptions(options, schema, allowUnknown) {
       const value = options[opt];
       const result = value === void 0 || validator(value, opt, options);
       if (result !== true) {
-        throw new AxiosError_default("option " + opt + " must be " + result, AxiosError_default.ERR_BAD_OPTION_VALUE);
+        throw new AxiosError_default(
+          "option " + opt + " must be " + result,
+          AxiosError_default.ERR_BAD_OPTION_VALUE
+        );
       }
       continue;
     }
@@ -32652,12 +32863,16 @@ var Axios = class {
     config = mergeConfig(this.defaults, config);
     const { transitional: transitional2, paramsSerializer, headers } = config;
     if (transitional2 !== void 0) {
-      validator_default.assertOptions(transitional2, {
-        silentJSONParsing: validators2.transitional(validators2.boolean),
-        forcedJSONParsing: validators2.transitional(validators2.boolean),
-        clarifyTimeoutError: validators2.transitional(validators2.boolean),
-        legacyInterceptorReqResOrdering: validators2.transitional(validators2.boolean)
-      }, false);
+      validator_default.assertOptions(
+        transitional2,
+        {
+          silentJSONParsing: validators2.transitional(validators2.boolean),
+          forcedJSONParsing: validators2.transitional(validators2.boolean),
+          clarifyTimeoutError: validators2.transitional(validators2.boolean),
+          legacyInterceptorReqResOrdering: validators2.transitional(validators2.boolean)
+        },
+        false
+      );
     }
     if (paramsSerializer != null) {
       if (utils_default.isFunction(paramsSerializer)) {
@@ -32665,10 +32880,14 @@ var Axios = class {
           serialize: paramsSerializer
         };
       } else {
-        validator_default.assertOptions(paramsSerializer, {
-          encode: validators2.function,
-          serialize: validators2.function
-        }, true);
+        validator_default.assertOptions(
+          paramsSerializer,
+          {
+            encode: validators2.function,
+            serialize: validators2.function
+          },
+          true
+        );
       }
     }
     if (config.allowAbsoluteUrls !== void 0) {
@@ -32677,21 +32896,19 @@ var Axios = class {
     } else {
       config.allowAbsoluteUrls = true;
     }
-    validator_default.assertOptions(config, {
-      baseUrl: validators2.spelling("baseURL"),
-      withXsrfToken: validators2.spelling("withXSRFToken")
-    }, true);
+    validator_default.assertOptions(
+      config,
+      {
+        baseUrl: validators2.spelling("baseURL"),
+        withXsrfToken: validators2.spelling("withXSRFToken")
+      },
+      true
+    );
     config.method = (config.method || this.defaults.method || "get").toLowerCase();
-    let contextHeaders = headers && utils_default.merge(
-      headers.common,
-      headers[config.method]
-    );
-    headers && utils_default.forEach(
-      ["delete", "get", "head", "post", "put", "patch", "common"],
-      (method) => {
-        delete headers[method];
-      }
-    );
+    let contextHeaders = headers && utils_default.merge(headers.common, headers[config.method]);
+    headers && utils_default.forEach(["delete", "get", "head", "post", "put", "patch", "common"], (method) => {
+      delete headers[method];
+    });
     config.headers = AxiosHeaders_default.concat(contextHeaders, headers);
     const requestInterceptorChain = [];
     let synchronousRequestInterceptors = true;
@@ -32758,24 +32975,28 @@ var Axios = class {
 };
 utils_default.forEach(["delete", "get", "head", "options"], function forEachMethodNoData(method) {
   Axios.prototype[method] = function(url2, config) {
-    return this.request(mergeConfig(config || {}, {
-      method,
-      url: url2,
-      data: (config || {}).data
-    }));
+    return this.request(
+      mergeConfig(config || {}, {
+        method,
+        url: url2,
+        data: (config || {}).data
+      })
+    );
   };
 });
 utils_default.forEach(["post", "put", "patch"], function forEachMethodWithData(method) {
   function generateHTTPMethod(isForm) {
     return function httpMethod(url2, data, config) {
-      return this.request(mergeConfig(config || {}, {
-        method,
-        headers: isForm ? {
-          "Content-Type": "multipart/form-data"
-        } : {},
-        url: url2,
-        data
-      }));
+      return this.request(
+        mergeConfig(config || {}, {
+          method,
+          headers: isForm ? {
+            "Content-Type": "multipart/form-data"
+          } : {},
+          url: url2,
+          data
+        })
+      );
     };
   }
   Axios.prototype[method] = generateHTTPMethod();
@@ -33095,7 +33316,7 @@ var slashPattern = /\\\\/g;
 var openPattern = /\\{/g;
 var closePattern = /\\}/g;
 var commaPattern = /\\,/g;
-var periodPattern = /\\./g;
+var periodPattern = /\\\./g;
 var EXPANSION_MAX = 1e5;
 function numeric(str) {
   return !isNaN(str) ? parseInt(str, 10) : str.charCodeAt(0);
@@ -33369,8 +33590,56 @@ var unescape2 = (s, { windowsPathsNoEscape = false, magicalBraces = true } = {})
 };
 
 // node_modules/minimatch/dist/esm/ast.js
+var _a;
 var types = /* @__PURE__ */ new Set(["!", "?", "+", "*", "@"]);
 var isExtglobType = (c) => types.has(c);
+var isExtglobAST = (c) => isExtglobType(c.type);
+var adoptionMap = /* @__PURE__ */ new Map([
+  ["!", ["@"]],
+  ["?", ["?", "@"]],
+  ["@", ["@"]],
+  ["*", ["*", "+", "?", "@"]],
+  ["+", ["+", "@"]]
+]);
+var adoptionWithSpaceMap = /* @__PURE__ */ new Map([
+  ["!", ["?"]],
+  ["@", ["?"]],
+  ["+", ["?", "*"]]
+]);
+var adoptionAnyMap = /* @__PURE__ */ new Map([
+  ["!", ["?", "@"]],
+  ["?", ["?", "@"]],
+  ["@", ["?", "@"]],
+  ["*", ["*", "+", "?", "@"]],
+  ["+", ["+", "@", "?", "*"]]
+]);
+var usurpMap = /* @__PURE__ */ new Map([
+  ["!", /* @__PURE__ */ new Map([["!", "@"]])],
+  [
+    "?",
+    /* @__PURE__ */ new Map([
+      ["*", "*"],
+      ["+", "*"]
+    ])
+  ],
+  [
+    "@",
+    /* @__PURE__ */ new Map([
+      ["!", "!"],
+      ["?", "?"],
+      ["@", "@"],
+      ["*", "*"],
+      ["+", "+"]
+    ])
+  ],
+  [
+    "+",
+    /* @__PURE__ */ new Map([
+      ["?", "*"],
+      ["*", "*"]
+    ])
+  ]
+]);
 var startNoTraversal = "(?!(?:^|/)\\.\\.?(?:$|/))";
 var startNoDot = "(?!\\.)";
 var addPatternStart = /* @__PURE__ */ new Set(["[", "."]);
@@ -33380,7 +33649,8 @@ var regExpEscape = (s) => s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
 var qmark = "[^/]";
 var star = qmark + "*?";
 var starNoEmpty = qmark + "+?";
-var AST = class _AST {
+var ID = 0;
+var AST = class {
   type;
   #root;
   #hasMagic;
@@ -33395,6 +33665,22 @@ var AST = class _AST {
   // set to true if it's an extglob with no children
   // (which really means one child of '')
   #emptyExt = false;
+  id = ++ID;
+  get depth() {
+    return (this.#parent?.depth ?? -1) + 1;
+  }
+  [/* @__PURE__ */ Symbol.for("nodejs.util.inspect.custom")]() {
+    return {
+      "@@type": "AST",
+      id: this.id,
+      type: this.type,
+      root: this.#root.id,
+      parent: this.#parent?.id,
+      depth: this.depth,
+      partsLength: this.#parts.length,
+      parts: this.#parts
+    };
+  }
   constructor(type, parent, options = {}) {
     this.type = type;
     if (type)
@@ -33460,7 +33746,7 @@ var AST = class _AST {
     for (const p of parts) {
       if (p === "")
         continue;
-      if (typeof p !== "string" && !(p instanceof _AST && p.#parent === this)) {
+      if (typeof p !== "string" && !(p instanceof _a && p.#parent === this)) {
         throw new Error("invalid part: " + p);
       }
       this.#parts.push(p);
@@ -33485,7 +33771,7 @@ var AST = class _AST {
     const p = this.#parent;
     for (let i = 0; i < this.#parentIndex; i++) {
       const pp = p.#parts[i];
-      if (!(pp instanceof _AST && pp.type === "!")) {
+      if (!(pp instanceof _a && pp.type === "!")) {
         return false;
       }
     }
@@ -33510,13 +33796,14 @@ var AST = class _AST {
       this.push(part.clone(this));
   }
   clone(parent) {
-    const c = new _AST(this.type, parent);
+    const c = new _a(this.type, parent);
     for (const p of this.#parts) {
       c.copyIn(p);
     }
     return c;
   }
-  static #parseAST(str, ast, pos, opt) {
+  static #parseAST(str, ast, pos, opt, extDepth) {
+    const maxDepth = opt.maxExtglobRecursion ?? 2;
     let escaping = false;
     let inBrace = false;
     let braceStart = -1;
@@ -33548,11 +33835,12 @@ var AST = class _AST {
           acc2 += c;
           continue;
         }
-        if (!opt.noext && isExtglobType(c) && str.charAt(i2) === "(") {
+        const doRecurse = !opt.noext && isExtglobType(c) && str.charAt(i2) === "(" && extDepth <= maxDepth;
+        if (doRecurse) {
           ast.push(acc2);
           acc2 = "";
-          const ext2 = new _AST(c, ast);
-          i2 = _AST.#parseAST(str, ext2, i2, opt);
+          const ext2 = new _a(c, ast);
+          i2 = _a.#parseAST(str, ext2, i2, opt, extDepth + 1);
           ast.push(ext2);
           continue;
         }
@@ -33562,7 +33850,7 @@ var AST = class _AST {
       return i2;
     }
     let i = pos + 1;
-    let part = new _AST(null, ast);
+    let part = new _a(null, ast);
     const parts = [];
     let acc = "";
     while (i < str.length) {
@@ -33589,19 +33877,22 @@ var AST = class _AST {
         acc += c;
         continue;
       }
-      if (isExtglobType(c) && str.charAt(i) === "(") {
+      const doRecurse = !opt.noext && isExtglobType(c) && str.charAt(i) === "(" && /* c8 ignore start - the maxDepth is sufficient here */
+      (extDepth <= maxDepth || ast && ast.#canAdoptType(c));
+      if (doRecurse) {
+        const depthAdd = ast && ast.#canAdoptType(c) ? 0 : 1;
         part.push(acc);
         acc = "";
-        const ext2 = new _AST(c, part);
+        const ext2 = new _a(c, part);
         part.push(ext2);
-        i = _AST.#parseAST(str, ext2, i, opt);
+        i = _a.#parseAST(str, ext2, i, opt, extDepth + depthAdd);
         continue;
       }
       if (c === "|") {
         part.push(acc);
         acc = "";
         parts.push(part);
-        part = new _AST(null, ast);
+        part = new _a(null, ast);
         continue;
       }
       if (c === ")") {
@@ -33620,9 +33911,71 @@ var AST = class _AST {
     ast.#parts = [str.substring(pos - 1)];
     return i;
   }
+  #canAdoptWithSpace(child) {
+    return this.#canAdopt(child, adoptionWithSpaceMap);
+  }
+  #canAdopt(child, map = adoptionMap) {
+    if (!child || typeof child !== "object" || child.type !== null || child.#parts.length !== 1 || this.type === null) {
+      return false;
+    }
+    const gc = child.#parts[0];
+    if (!gc || typeof gc !== "object" || gc.type === null) {
+      return false;
+    }
+    return this.#canAdoptType(gc.type, map);
+  }
+  #canAdoptType(c, map = adoptionAnyMap) {
+    return !!map.get(this.type)?.includes(c);
+  }
+  #adoptWithSpace(child, index) {
+    const gc = child.#parts[0];
+    const blank = new _a(null, gc, this.options);
+    blank.#parts.push("");
+    gc.push(blank);
+    this.#adopt(child, index);
+  }
+  #adopt(child, index) {
+    const gc = child.#parts[0];
+    this.#parts.splice(index, 1, ...gc.#parts);
+    for (const p of gc.#parts) {
+      if (typeof p === "object")
+        p.#parent = this;
+    }
+    this.#toString = void 0;
+  }
+  #canUsurpType(c) {
+    const m = usurpMap.get(this.type);
+    return !!m?.has(c);
+  }
+  #canUsurp(child) {
+    if (!child || typeof child !== "object" || child.type !== null || child.#parts.length !== 1 || this.type === null || this.#parts.length !== 1) {
+      return false;
+    }
+    const gc = child.#parts[0];
+    if (!gc || typeof gc !== "object" || gc.type === null) {
+      return false;
+    }
+    return this.#canUsurpType(gc.type);
+  }
+  #usurp(child) {
+    const m = usurpMap.get(this.type);
+    const gc = child.#parts[0];
+    const nt2 = m?.get(gc.type);
+    if (!nt2)
+      return false;
+    this.#parts = gc.#parts;
+    for (const p of this.#parts) {
+      if (typeof p === "object") {
+        p.#parent = this;
+      }
+    }
+    this.type = nt2;
+    this.#toString = void 0;
+    this.#emptyExt = false;
+  }
   static fromGlob(pattern, options = {}) {
-    const ast = new _AST(null, void 0, options);
-    _AST.#parseAST(pattern, ast, 0, options);
+    const ast = new _a(null, void 0, options);
+    _a.#parseAST(pattern, ast, 0, options, 0);
     return ast;
   }
   // returns the regular expression if there's magic, or the unescaped
@@ -33716,12 +34069,14 @@ var AST = class _AST {
   // or start or whatever) and prepend ^ or / at the Regexp construction.
   toRegExpSource(allowDot) {
     const dot = allowDot ?? !!this.#options.dot;
-    if (this.#root === this)
+    if (this.#root === this) {
+      this.#flatten();
       this.#fillNegs();
-    if (!this.type) {
+    }
+    if (!isExtglobAST(this)) {
       const noEmpty = this.isStart() && this.isEnd() && !this.#parts.some((s) => typeof s !== "string");
       const src = this.#parts.map((p) => {
-        const [re2, _2, hasMagic, uflag] = typeof p === "string" ? _AST.#parseGlob(p, this.#hasMagic, noEmpty) : p.toRegExpSource(allowDot);
+        const [re2, _2, hasMagic, uflag] = typeof p === "string" ? _a.#parseGlob(p, this.#hasMagic, noEmpty) : p.toRegExpSource(allowDot);
         this.#hasMagic = this.#hasMagic || hasMagic;
         this.#uflag = this.#uflag || uflag;
         return re2;
@@ -33760,9 +34115,10 @@ var AST = class _AST {
     let body = this.#partsToRegExp(dot);
     if (this.isStart() && this.isEnd() && !body && this.type !== "!") {
       const s = this.toString();
-      this.#parts = [s];
-      this.type = null;
-      this.#hasMagic = void 0;
+      const me2 = this;
+      me2.#parts = [s];
+      me2.type = null;
+      me2.#hasMagic = void 0;
       return [s, unescape2(this.toString()), false, false];
     }
     let bodyDotAllowed = !repeated || allowDot || dot || !startNoDot ? "" : this.#partsToRegExp(true);
@@ -33788,6 +34144,38 @@ var AST = class _AST {
       this.#hasMagic = !!this.#hasMagic,
       this.#uflag
     ];
+  }
+  #flatten() {
+    if (!isExtglobAST(this)) {
+      for (const p of this.#parts) {
+        if (typeof p === "object") {
+          p.#flatten();
+        }
+      }
+    } else {
+      let iterations = 0;
+      let done = false;
+      do {
+        done = true;
+        for (let i = 0; i < this.#parts.length; i++) {
+          const c = this.#parts[i];
+          if (typeof c === "object") {
+            c.#flatten();
+            if (this.#canAdopt(c)) {
+              done = false;
+              this.#adopt(c, i);
+            } else if (this.#canAdoptWithSpace(c)) {
+              done = false;
+              this.#adoptWithSpace(c, i);
+            } else if (this.#canUsurp(c)) {
+              done = false;
+              this.#usurp(c);
+            }
+          }
+        }
+      } while (!done && ++iterations < 10);
+    }
+    this.#toString = void 0;
   }
   #partsToRegExp(dot) {
     return this.#parts.map((p) => {
@@ -33849,6 +34237,7 @@ var AST = class _AST {
     return [re2, unescape2(glob), !!hasMagic, uflag];
   }
 };
+_a = AST;
 
 // node_modules/minimatch/dist/esm/escape.js
 var escape = (s, { windowsPathsNoEscape = false, magicalBraces = false } = {}) => {
@@ -34007,11 +34396,13 @@ var Minimatch = class {
   isWindows;
   platform;
   windowsNoMagicRoot;
+  maxGlobstarRecursion;
   regexp;
   constructor(pattern, options = {}) {
     assertValidPattern(pattern);
     options = options || {};
     this.options = options;
+    this.maxGlobstarRecursion = options.maxGlobstarRecursion ?? 200;
     this.pattern = pattern;
     this.platform = options.platform || defaultPlatform;
     this.isWindows = this.platform === "win32";
@@ -34348,7 +34739,8 @@ var Minimatch = class {
   // out of pattern, then that's fine, as long as all
   // the parts match.
   matchOne(file, pattern, partial = false) {
-    const options = this.options;
+    let fileStartIndex = 0;
+    let patternStartIndex = 0;
     if (this.isWindows) {
       const fileDrive = typeof file[0] === "string" && /^[a-z]:$/i.test(file[0]);
       const fileUNC = !fileDrive && file[0] === "" && file[1] === "" && file[2] === "?" && /^[a-z]:$/i.test(file[3]);
@@ -34363,11 +34755,8 @@ var Minimatch = class {
         ];
         if (fd.toLowerCase() === pd.toLowerCase()) {
           pattern[pdi] = fd;
-          if (pdi > fdi) {
-            pattern = pattern.slice(pdi);
-          } else if (fdi > pdi) {
-            file = file.slice(fdi);
-          }
+          patternStartIndex = pdi;
+          fileStartIndex = fdi;
         }
       }
     }
@@ -34375,49 +34764,123 @@ var Minimatch = class {
     if (optimizationLevel >= 2) {
       file = this.levelTwoFileOptimize(file);
     }
-    this.debug("matchOne", this, { file, pattern });
-    this.debug("matchOne", file.length, pattern.length);
-    for (var fi2 = 0, pi2 = 0, fl = file.length, pl = pattern.length; fi2 < fl && pi2 < pl; fi2++, pi2++) {
-      this.debug("matchOne loop");
-      var p = pattern[pi2];
-      var f = file[fi2];
-      this.debug(pattern, p, f);
-      if (p === false) {
+    if (pattern.includes(GLOBSTAR)) {
+      return this.#matchGlobstar(file, pattern, partial, fileStartIndex, patternStartIndex);
+    }
+    return this.#matchOne(file, pattern, partial, fileStartIndex, patternStartIndex);
+  }
+  #matchGlobstar(file, pattern, partial, fileIndex, patternIndex) {
+    const firstgs = pattern.indexOf(GLOBSTAR, patternIndex);
+    const lastgs = pattern.lastIndexOf(GLOBSTAR);
+    const [head, body, tail] = partial ? [
+      pattern.slice(patternIndex, firstgs),
+      pattern.slice(firstgs + 1),
+      []
+    ] : [
+      pattern.slice(patternIndex, firstgs),
+      pattern.slice(firstgs + 1, lastgs),
+      pattern.slice(lastgs + 1)
+    ];
+    if (head.length) {
+      const fileHead = file.slice(fileIndex, fileIndex + head.length);
+      if (!this.#matchOne(fileHead, head, partial, 0, 0)) {
         return false;
       }
-      if (p === GLOBSTAR) {
-        this.debug("GLOBSTAR", [pattern, p, f]);
-        var fr = fi2;
-        var pr = pi2 + 1;
-        if (pr === pl) {
-          this.debug("** at the end");
-          for (; fi2 < fl; fi2++) {
-            if (file[fi2] === "." || file[fi2] === ".." || !options.dot && file[fi2].charAt(0) === ".")
-              return false;
-          }
-          return true;
+      fileIndex += head.length;
+      patternIndex += head.length;
+    }
+    let fileTailMatch = 0;
+    if (tail.length) {
+      if (tail.length + fileIndex > file.length)
+        return false;
+      let tailStart = file.length - tail.length;
+      if (this.#matchOne(file, tail, partial, tailStart, 0)) {
+        fileTailMatch = tail.length;
+      } else {
+        if (file[file.length - 1] !== "" || fileIndex + tail.length === file.length) {
+          return false;
         }
-        while (fr < fl) {
-          var swallowee = file[fr];
-          this.debug("\nglobstar while", file, fr, pattern, pr, swallowee);
-          if (this.matchOne(file.slice(fr), pattern.slice(pr), partial)) {
-            this.debug("globstar found match!", fr, fl, swallowee);
-            return true;
-          } else {
-            if (swallowee === "." || swallowee === ".." || !options.dot && swallowee.charAt(0) === ".") {
-              this.debug("dot detected!", file, fr, pattern, pr);
-              break;
-            }
-            this.debug("globstar swallow a segment, and continue");
-            fr++;
-          }
+        tailStart--;
+        if (!this.#matchOne(file, tail, partial, tailStart, 0)) {
+          return false;
         }
-        if (partial) {
-          this.debug("\n>>> no match, partial?", file, fr, pattern, pr);
-          if (fr === fl) {
-            return true;
-          }
+        fileTailMatch = tail.length + 1;
+      }
+    }
+    if (!body.length) {
+      let sawSome = !!fileTailMatch;
+      for (let i2 = fileIndex; i2 < file.length - fileTailMatch; i2++) {
+        const f = String(file[i2]);
+        sawSome = true;
+        if (f === "." || f === ".." || !this.options.dot && f.startsWith(".")) {
+          return false;
         }
+      }
+      return partial || sawSome;
+    }
+    const bodySegments = [[[], 0]];
+    let currentBody = bodySegments[0];
+    let nonGsParts = 0;
+    const nonGsPartsSums = [0];
+    for (const b of body) {
+      if (b === GLOBSTAR) {
+        nonGsPartsSums.push(nonGsParts);
+        currentBody = [[], 0];
+        bodySegments.push(currentBody);
+      } else {
+        currentBody[0].push(b);
+        nonGsParts++;
+      }
+    }
+    let i = bodySegments.length - 1;
+    const fileLength = file.length - fileTailMatch;
+    for (const b of bodySegments) {
+      b[1] = fileLength - (nonGsPartsSums[i--] + b[0].length);
+    }
+    return !!this.#matchGlobStarBodySections(file, bodySegments, fileIndex, 0, partial, 0, !!fileTailMatch);
+  }
+  // return false for "nope, not matching"
+  // return null for "not matching, cannot keep trying"
+  #matchGlobStarBodySections(file, bodySegments, fileIndex, bodyIndex, partial, globStarDepth, sawTail) {
+    const bs2 = bodySegments[bodyIndex];
+    if (!bs2) {
+      for (let i = fileIndex; i < file.length; i++) {
+        sawTail = true;
+        const f = file[i];
+        if (f === "." || f === ".." || !this.options.dot && f.startsWith(".")) {
+          return false;
+        }
+      }
+      return sawTail;
+    }
+    const [body, after] = bs2;
+    while (fileIndex <= after) {
+      const m = this.#matchOne(file.slice(0, fileIndex + body.length), body, partial, fileIndex, 0);
+      if (m && globStarDepth < this.maxGlobstarRecursion) {
+        const sub = this.#matchGlobStarBodySections(file, bodySegments, fileIndex + body.length, bodyIndex + 1, partial, globStarDepth + 1, sawTail);
+        if (sub !== false) {
+          return sub;
+        }
+      }
+      const f = file[fileIndex];
+      if (f === "." || f === ".." || !this.options.dot && f.startsWith(".")) {
+        return false;
+      }
+      fileIndex++;
+    }
+    return partial || null;
+  }
+  #matchOne(file, pattern, partial, fileIndex, patternIndex) {
+    let fi2;
+    let pi2;
+    let pl;
+    let fl;
+    for (fi2 = fileIndex, pi2 = patternIndex, fl = file.length, pl = pattern.length; fi2 < fl && pi2 < pl; fi2++, pi2++) {
+      this.debug("matchOne loop");
+      let p = pattern[pi2];
+      let f = file[fi2];
+      this.debug(pattern, p, f);
+      if (p === false || p === GLOBSTAR) {
         return false;
       }
       let hit;
@@ -35042,7 +35505,7 @@ var Summary = class {
       }
       try {
         yield access(pathFromEnv, import_fs2.constants.R_OK | import_fs2.constants.W_OK);
-      } catch (_a) {
+      } catch (_a2) {
         throw new Error(`Unable to access summary file: '${pathFromEnv}'. Check if the file has correct read/write permissions.`);
       }
       this._filePath = pathFromEnv;
@@ -36633,7 +37096,7 @@ var Ne = typeof process == "object" && process ? process : { stdout: null, stder
 var oi = (n7) => !!n7 && typeof n7 == "object" && (n7 instanceof V || n7 instanceof import_node_stream.default || hi(n7) || ai(n7));
 var hi = (n7) => !!n7 && typeof n7 == "object" && n7 instanceof import_node_events.EventEmitter && typeof n7.pipe == "function" && n7.pipe !== import_node_stream.default.Writable.prototype.pipe;
 var ai = (n7) => !!n7 && typeof n7 == "object" && n7 instanceof import_node_events.EventEmitter && typeof n7.write == "function" && typeof n7.end == "function";
-var G = /* @__PURE__ */ Symbol("EOF");
+var G2 = /* @__PURE__ */ Symbol("EOF");
 var H = /* @__PURE__ */ Symbol("maybeEmitEnd");
 var K = /* @__PURE__ */ Symbol("emittedEnd");
 var kt = /* @__PURE__ */ Symbol("emittingEnd");
@@ -36705,7 +37168,7 @@ var V = class extends import_node_events.EventEmitter {
   [P];
   [B];
   [et];
-  [G] = false;
+  [G2] = false;
   [K] = false;
   [kt] = false;
   [Rt] = false;
@@ -36759,7 +37222,7 @@ var V = class extends import_node_events.EventEmitter {
   }
   write(t, e, s) {
     if (this[Dt]) return false;
-    if (this[G]) throw new Error("write after end");
+    if (this[G2]) throw new Error("write after end");
     if (this[x]) return this.emit("error", Object.assign(new Error("Cannot call write after a stream was destroyed"), { code: "ERR_STREAM_DESTROYED" })), true;
     typeof e == "function" && (s = e, e = "utf8"), e || (e = "utf8");
     let i = this[B] ? mt : li;
@@ -36783,13 +37246,13 @@ var V = class extends import_node_events.EventEmitter {
       let s = e;
       t === s.length || t === null ? this[Ft]() : typeof s == "string" ? (this[C][0] = s.slice(t), e = s.slice(0, t), this[T] -= t) : (this[C][0] = s.subarray(t), e = s.subarray(0, t), this[T] -= t);
     }
-    return this.emit("data", e), !this[C].length && !this[G] && this.emit("drain"), e;
+    return this.emit("data", e), !this[C].length && !this[G2] && this.emit("drain"), e;
   }
   end(t, e, s) {
-    return typeof t == "function" && (s = t, t = void 0), typeof e == "function" && (s = e, e = "utf8"), t !== void 0 && this.write(t, e), s && this.once("end", s), this[G] = true, this.writable = false, (this[v] || !this[dt]) && this[H](), this;
+    return typeof t == "function" && (s = t, t = void 0), typeof e == "function" && (s = e, e = "utf8"), t !== void 0 && this.write(t, e), s && this.once("end", s), this[G2] = true, this.writable = false, (this[v] || !this[dt]) && this[H](), this;
   }
   [st]() {
-    this[x] || (!this[Y] && !this[F].length && (this[M] = true), this[dt] = false, this[v] = true, this.emit("resume"), this[C].length ? this[Ot]() : this[G] ? this[H]() : this.emit("drain"));
+    this[x] || (!this[Y] && !this[F].length && (this[M] = true), this[dt] = false, this[v] = true, this.emit("resume"), this[C].length ? this[Ot]() : this[G2] ? this[H]() : this.emit("drain"));
   }
   resume() {
     return this[st]();
@@ -36816,7 +37279,7 @@ var V = class extends import_node_events.EventEmitter {
     do
       ;
     while (this[Le](this[Ft]()) && this[C].length);
-    !t && !this[C].length && !this[G] && this.emit("drain");
+    !t && !this[C].length && !this[G2] && this.emit("drain");
   }
   [Le](t) {
     return this.emit("data", t), this[v];
@@ -36860,7 +37323,7 @@ var V = class extends import_node_events.EventEmitter {
     return this[K];
   }
   [H]() {
-    !this[kt] && !this[K] && !this[x] && this[C].length === 0 && this[G] && (this[kt] = true, this.emit("end"), this.emit("prefinish"), this.emit("finish"), this[Rt] && this.emit("close"), this[kt] = false);
+    !this[kt] && !this[K] && !this[x] && this[C].length === 0 && this[G2] && (this[kt] = true, this.emit("end"), this.emit("prefinish"), this.emit("finish"), this[Rt] && this.emit("close"), this[kt] = false);
   }
   emit(t, ...e) {
     let s = e[0];
@@ -36930,11 +37393,11 @@ var V = class extends import_node_events.EventEmitter {
       if (t) return e();
       let i = this.read();
       if (i !== null) return Promise.resolve({ done: false, value: i });
-      if (this[G]) return e();
+      if (this[G2]) return e();
       let r, o, h = (c) => {
         this.off("data", a), this.off("end", l), this.off(x, u), e(), o(c);
       }, a = (c) => {
-        this.off("error", h), this.off("end", l), this.off(x, u), this.pause(), r({ value: c, done: !!this[G] });
+        this.off("error", h), this.off("end", l), this.off(x, u), this.pause(), r({ value: c, done: !!this[G2] });
       }, l = () => {
         this.off("error", h), this.off("data", a), this.off(x, u), e(), r({ done: true, value: void 0 });
       }, u = () => h(new Error("stream destroyed"));

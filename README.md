@@ -79,7 +79,7 @@ Inspired by: https://github.com/cringdahl/sharepoint-file-upload-action
 Install node/npm
 ```
 curl -o- https://fnm.vercel.app/install | bash
-fnm install 20
+fnm install 24
 ```
 
 Install dependencies (includes esbuild)
